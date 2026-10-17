@@ -1,0 +1,1 @@
+web: gunicorn bcw_middleware_blueprint:app

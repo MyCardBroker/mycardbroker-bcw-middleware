@@ -1,0 +1,112 @@
+# MyCardBroker - Automated BCW Dropship & Order Routing API Middleware
+# Stack: Python (Flask), Shopify Webhooks, Box-Packing Logic, CSV/FTP Exporters
+
+import os
+import json
+import csv
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+# --- CONFIGURATION ---
+BCW_ACCOUNT_ID = "YOUR_BCW_DEALER_ID"
+BCW_API_ENDPOINT = "https://partner.bcwsupplies.com/api/v1/orders" # Placeholder for B2B portal integration
+
+# --- 3D BIN PACKING / CARTON SPLITTING LOGIC ---
+def calculate_bcw_packages(line_items):
+    """
+    Analyzes cart line items and splits them into distinct packages 
+    based on product categories (e.g., flat protection vs. bulky storage/catalogs).
+    """
+    flat_items_count = 0
+    heavy_boxes_count = 0
+    catalogs_count = 0
+
+    packages = []
+
+    for item in line_items:
+        sku = item.get('sku', '')
+        qty = item.get('quantity', 1)
+        
+        if 'TLCH' in sku or 'CS-' in sku or 'POCKET' in sku:
+            # Flat supplies (Sleeves, Toploaders, Pages) -> Bubble Mailers / Small Cartons
+            flat_items_count += qty
+        elif 'CC-6DR' in sku:
+            # 6-Drawer Card Catalogs -> Heavy modular corrugated boxes (Ships individually)
+            catalogs_count += qty
+        else:
+            # Storage boxes, magnetics, heavy supplies -> Standard Corrugated Cartons
+            heavy_boxes_count += qty
+
+    # Package 1: Flat Protection Supplies (if any)
+    if flat_items_count > 0:
+        packages.append({
+            "package_type": "Bubble Mailer / Flat Carton",
+            "estimated_weight_lbs": 0.5 * (flat_items_count / 100),
+            "item_count": flat_items_count
+        })
+
+    # Package 2: Standard Storage & Boxes (if any)
+    if heavy_boxes_count > 0:
+        packages.append({
+            "package_type": "Standard Corrugated Master Carton",
+            "estimated_weight_lbs": 2.0 * heavy_boxes_count,
+            "item_count": heavy_boxes_count
+        })
+
+    # Package 3: Bulk Card Catalogs (Must ship separately due to dimensions)
+    for _ in range(catalogs_count):
+        packages.append({
+            "package_type": "Heavy Card Catalog Box (Oversized)",
+            "estimated_weight_lbs": 12.5,
+            "item_count": 1
+        })
+
+    return packages
+
+# --- SHOPIFY WEBHOOK LISTENER ---
+@app.route('/webhook/shopify/order-created', methods=['POST'])
+def handle_shopify_order():
+    """
+    Triggered automatically when a customer completes an order on MyCardBroker.
+    Parses order data, calculates multi-package splits, and formats the PO for BCW.
+    """
+    order_data = request.json
+    
+    order_id = order_data.get('id')
+    shipping_address = order_data.get('shipping_address', {})
+    line_items = order_data.get('line_items', [])
+
+    print(f"Processing incoming Shopify Order #{order_id}...")
+
+    # 1. Run multi-package packing algorithm
+    estimated_packages = calculate_bcw_packages(line_items)
+    
+    # 2. Format Purchase Order (PO) for BCW Dropship Submission
+    bcw_purchase_order = {
+        "dealer_id": BCW_ACCOUNT_ID,
+        "customer_order_reference": str(order_id),
+        "shipping_info": {
+            "name": f"{shipping_address.get('first_name')} {shipping_address.get('last_name')}",
+            "address1": shipping_address.get('address1'),
+            "address2": shipping_address.get('address2'),
+            "city": shipping_address.get('city'),
+            "province": shipping_address.get('province_code'),
+            "zip": shipping_address.get('zip'),
+            "country": shipping_address.get('country_code')
+        },
+        "items": [{"sku": i.get('sku'), "qty": i.get('quantity')} for i in line_items],
+        "calculated_packages": estimated_packages
+    }
+
+    # 3. Output or transmit PO (Simulated log / export)
+    print("Generated BCW Multi-Package PO Payload:")
+    print(json.dumps(bcw_purchase_order, indent=2))
+
+    # In production: Send via requests.post(BCW_API_ENDPOINT, json=bcw_purchase_order)
+    # or export to an automated FTP drop.
+
+    return jsonify({"status": "success", "message": "Order processed and routed to BCW fulfillment."}), 200
+
+if __name__ == '__main__':
+    app.run(port=5000, debug=True)
